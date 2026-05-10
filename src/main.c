@@ -1,274 +1,107 @@
-#include <zephyr/kernel.h>
+
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
-#include <pwm_z42.h>
-#include "ultrassom.h"
-
 
 // ==============================================================================================================================
-// DEFINIÇÕES E VELOCIDADES
+// DEFINIÇÃO E SELEÇÃO/CONFIGURAÇÕES DE PARÂMETROS
 // ==============================================================================================================================
-#define TPM_MODULE          1000
-#define DISTANCIA_PARADA    20    // Distância de segurança em cm
+#define TRIG_PIN 1                              // PTD1
+#define ECHO_PIN 3                              // PTD3
 
+/* EXPLICAÇÃO DOS STRUCTS:
+ * Aqui criamos ponteiros para acessar o hardware da placa (Porta D) e para a estrutura de callback 
+ * que o sistema operacional Zephyr exige para gerenciar as interrupções de pinos.
+ */
+static const struct device *gpio_dev;
+static struct gpio_callback echo_cb_data;
 
-// Motor B está girando menos em relação ao Motor A, devido a defeito mecânico. Por essa razão, tem-se que abaixar a potência do Motor A para
-// equilibrar as velocidades de rotação de ambos. A relação de ambos para o equilíbrio é de:
-//
-// MOTOR B = 100% da potência -----> MOTOR A = 91,23% da potência      (Sob velocidades máximas)
-//
-// Desta forma, basta utilizar proporcionalidade (regra de 3) para definir a potência do Motor A sobre qualquer valor para o Motor B, para qual
-// estejam em equilíbrio
-
-
-// Ajuste das velocidades (Lembre-se de fornecer o suficiente para "VEL_FRENTE/A" para haver torque, para assim, quebrar a inércia do motor)
-uint16_t VEL_FRENTE             = TPM_MODULE;          // diminuir velocidade
-uint16_t VEL_FRENTE_A           = TPM_MODULE * 0.9123;   //diminuir velocidade
-uint16_t VEL_CURVA_REVERSA      = TPM_MODULE;            
-uint16_t VEL_CURVA_REVERSA_A    = TPM_MODULE * 0.9123;
-uint16_t VEL_PARADO             = 0;
-
-
-// Definição das portas e pinos dos sensores a serem utilizadas
-#define PORTA_A         DT_NODELABEL(gpioa)
-#define PORTA_E         DT_NODELABEL(gpioe)
-#define SENSOR_A_PIN    1                       // PTA1     (Sensor da Esquerda)
-#define SENSOR_B_PIN    30                      // PTE30    (Sensor da Direita)
-
-
-// Definição dos LEDs via DeviceTree
-static const struct gpio_dt_spec led_blue   = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-static const struct gpio_dt_spec led_green  = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
-
+/* EXPLICAÇÃO DO 'VOLATILE':
+ * A palavra-chave 'volatile' foi crucial aqui. Ela avisa ao compilador: "Não otimize ou faça cache destas
+ * variáveis! Elas podem mudar a qualquer instante por forças externas (o sensor)". Como essas variáveis são 
+ * modificadas dentro de uma Interrupção (ISR) paralela ao código principal, sem o 'volatile', o 'main.c' 
+ * leria valores congelados, e o carrinho nunca enxergaria o obstáculo.
+ */
+volatile uint32_t tempo_inicio = 0;
+volatile uint32_t distancia_cm = 999;
+volatile uint32_t isr_count = 0;                // Contador para saber se o sinal físico chegou
 
 // ==============================================================================================================================
-// MÁQUINA DE ESTADOS
+// ISR: Disparada em qualquer mudança (subida ou descida) no pino Echo
 // ==============================================================================================================================
-typedef enum {
-    PARADO,
-    FRENTE,
-    CURVA_ESQUERDA,     // Sensor A perdeu linha -> vira à esquerda
-    CURVA_DIREITA,      // Sensor B perdeu linha -> vira à direita
-    OBSTACULO
-} carrinho_estado_t;
+/* EXPLICAÇÃO DA ISR (Interrupt Service Routine):
+ * Uma ISR paralisa a CPU instantaneamente no exato nanossegundo em que o pino Echo muda fisicamente de estado.
+ * Isso resolve os atrasos de leitura. Se o 'main' estivesse ocupado controlando os motores, a ISR interrompe 
+ * tudo, anota o tempo e devolve o controle.
+ */
+void echo_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    uint32_t agora = k_cycle_get_32();              // k_cycle_get_32() acessa o relógio interno do microcontrolador (ciclos de CPU).
+    isr_count++;                                    // É um cronômetro de extrema precisão nativo do Zephyr.
 
-
-// ==============================================================================================================================
-// HELPERS (Simplificador de comandos, configura os pinos a serem usados e integra a ação desses pinos através de um único comando)
-// ==============================================================================================================================
-static inline void set_velocidade(uint16_t motor_a, uint16_t motor_b){
-    pwm_tpm_CnV(TPM2, 0, motor_a);
-    pwm_tpm_CnV(TPM2, 1, motor_b);
-}
-static inline void set_led(int blue, int green){
-    gpio_pin_set_dt(&led_blue, blue);
-    gpio_pin_set_dt(&led_green, green);
-}
-// Controla a direção alterando a Ponte H dinamicamente
-static inline void set_direcao(const struct device *dev_a, const struct device *dev_e, bool motor_a_frente, bool motor_b_frente) {
-    if (motor_a_frente) {               // Motor A (Pinos PTE0 e PTE1)
-        gpio_pin_set(dev_e, 0, 1);      // IN1 = 0                  
-        gpio_pin_set(dev_e, 1, 0);      // IN2 = 1                  
-    } else {
-        gpio_pin_set(dev_e, 0, 0);      // IN1 = 1 (Ré)              
-        gpio_pin_set(dev_e, 1, 1);      // IN2 = 0 (Ré)              
-    }
-    if (motor_b_frente) {               // Motor B (Pinos PTA16 e PTA17)
-        gpio_pin_set(dev_a, 16, 1);     // IN3 = 0                  
-        gpio_pin_set(dev_a, 17, 0);     // IN4 = 1                  
-    } else {
-        gpio_pin_set(dev_a, 16, 0);     // IN3 = 1 (Ré)            
-        gpio_pin_set(dev_a, 17, 1);     // IN4 = 0 (Ré)            
+    // Borda de Subida: Início do eco
+    if(gpio_pin_get(dev, ECHO_PIN) > 0) tempo_inicio = agora;      // O som acabou de sair do sensor. Marcamos a "foto" desse instante salvando o ciclo da CPU atual.
+    
+    // Borda de Descida: Fim do eco
+    else{    
+        if(tempo_inicio != 0){                              // O som bateu no obstáculo e voltou.
+            uint32_t diff = agora - tempo_inicio;           // Calculamos a diferença de ciclos desde que o som saiu até ele voltar
+            
+            // Converte ciclos de CPU para microssegundos e divide por 58 (constante do som)
+            
+            /* EXPLICAÇÃO DA MATEMÁTICA:
+             * 'k_cyc_to_us_floor32' converte o tempo de forma independente do clock da sua placa.
+             * A velocidade do som é ~340 m/s (ou 0.034 cm/us). 
+             * Como o som vai e volta, a fórmula real é: Distância = (Tempo(us) * 0.034) / 2.
+             * Dividir por 58 é a simplificação exata dessa fórmula, evitando uso de números quebrados (float) 
+             * que deixariam o microcontrolador mais lento.
+             */
+            distancia_cm = k_cyc_to_us_floor32(diff) / 58;
+            tempo_inicio = 0;                              // Zera o cronômetro para não processar dados fantasmas na próxima vez
+        }
     }
 }
 
-
-// ==============================================================================================================================
-// MAIN
-// ==============================================================================================================================
-int main(void) {
-                                                                    printk("[SISTEMA] Iniciando integração total do Carrinho...\n");
-    // 1. Inicializa PWM (TPM2) para os Motores
-    pwm_tpm_Init   (TPM2, TPM_PLLFLL, TPM_MODULE, TPM_CLK, PS_128, EDGE_PWM);
-    pwm_tpm_Ch_Init(TPM2, 0, TPM_PWM_H, GPIOB, 2);                  // ENA - Motor A
-    pwm_tpm_Ch_Init(TPM2, 1, TPM_PWM_H, GPIOB, 3);                  // ENB - Motor B
-                                                                    printk("[DEGUB] Motores inicalizados.\n");
-    // 2. Inicializa Ultrassom
-    ultrassom_init();
-                                                                    printk("[DEBUG] Ultrassom_init finalizada.\n");
-    // 3. Configura GPIOs para uso (Sensores e Direção)
-    const struct device *gpioa_dev = DEVICE_DT_GET(PORTA_A);
-    const struct device *gpioe_dev = DEVICE_DT_GET(PORTA_E);
-    if(!device_is_ready(gpioa_dev) || !device_is_ready(gpioe_dev)){
-                                                                    printk("[ERRO] Porta A ou E nao pronta!\n");
-        return 0;
+// ============================= INICIALIZA OS PINOS E INTERRUPÇÕES DO ULTRASSOM HC-SR04 ========================================
+void ultrassom_init(void) {
+    gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpiod));
+    
+    // O Zephyr é muito rigoroso. Se o hardware (.overlay) não estiver declarado, tentar configurá-lo
+    // gera um HardFault (tela azul da morte dos microcontroladores).
+    if (!device_is_ready(gpio_dev)) {
+                                                                printk("[ERRO] Porta D não habilitada no .overlay!\n");
+        return;
     }
-    // Direção: ambos os motores para frente
-    gpio_pin_configure(gpioe_dev, 0,  GPIO_OUTPUT_INACTIVE);        // IN1
-    gpio_pin_configure(gpioe_dev, 1,  GPIO_OUTPUT_INACTIVE);        // IN2
-    gpio_pin_configure(gpioa_dev, 16, GPIO_OUTPUT_INACTIVE);        // IN3
-    gpio_pin_configure(gpioa_dev, 17, GPIO_OUTPUT_INACTIVE);        // IN4
-    // Sensores com pull-up (retorna 0 quando detecta linha)
-    gpio_pin_configure(gpioa_dev, SENSOR_A_PIN, GPIO_INPUT | GPIO_PULL_UP);
-    gpio_pin_configure(gpioe_dev, SENSOR_B_PIN, GPIO_INPUT | GPIO_PULL_UP);
-                                                                    printk("[DEGUB] Configuração das GPIOs finalizada.\n");
-    // 4. Configura os LEDS para uso
-    if(!gpio_is_ready_dt(&led_blue) || !gpio_is_ready_dt(&led_green)) return 0;
-    gpio_pin_configure_dt(&led_blue,    GPIO_OUTPUT_INACTIVE);                
-    gpio_pin_configure_dt(&led_green,   GPIO_OUTPUT_INACTIVE);
-                                                                    printk("[DEGUB] Configuração dos LEDs finalizada.\n");
-    // 5. Define estado inicial para a máquina de estados e a váriavel volátil de verificação do ultrassom
-    carrinho_estado_t estado = PARADO;
-    carrinho_estado_t ultimo_estado = FRENTE;   // Memória da última ação válida
-    uint32_t contador = 0;              
-    uint32_t tempo_perdido = 0;                 // Contador de tempo fora da pista
-    uint32_t bloqueio_esquerda_timer = 0;
-                                                                    printk("[DEGUB] Entrando no loop principal.\n");
-// ==============================================================================================================================
-// LEITURAS
-// ==============================================================================================================================
-    while (1) {
-        // Dispara o trigger a cada 50ms (5 ciclos de 10ms)
-        if (contador % 5 == 0)  ultrassom_trigger();
+    gpio_pin_configure(gpio_dev, TRIG_PIN, GPIO_OUTPUT_INACTIVE);
+    gpio_pin_configure(gpio_dev, ECHO_PIN, GPIO_INPUT);
+    
+    /* EXPLICAÇÃO DA BORDA:
+     * Usar 'BOTH' permite que a mesma função ISR faça o papel duplo: ligar o cronômetro na subida do sinal
+     * e desligar na descida. O código fica enxuto e não precisamos de dois timers separados.
+     */
+    gpio_pin_interrupt_configure(gpio_dev, ECHO_PIN, GPIO_INT_EDGE_BOTH);       // Habilita interrupção em ambas as bordas (Both Edges)  
 
-
-        uint32_t dist = ultrassom_get_distancia();
-
-
-        // ========= Leitura dos Sensores IR (Lógica invertida: 0 = detecta linha) =============
-        bool esq_na_linha = (gpio_pin_get(gpioa_dev, SENSOR_A_PIN) == 0);
-        bool dir_na_linha = (gpio_pin_get(gpioe_dev, SENSOR_B_PIN) == 0);
-
-
-        // =============================== Transição de estados  ===============================
-        //      A   B       |       Ação
-        //      1   1       |       Frente          - Ambos na linha
-        //      1   0       |       Curva Dir.      - B perdeu  -   corrige para direita
-        //      0   1       |       Curva Esq.      - A perdeu  -   corrige para esquerda
-        //      1   1       |       Parado          - linha perdida completamente
-       
-        if (bloqueio_esquerda_timer > 0)    bloqueio_esquerda_timer--;      // Decrementa o temporizador de bloqueio a cada ciclo de 10ms
-
-
-        // Prioridade 1: Segurança (Obstáculo)
-        if (dist > 0 && dist < DISTANCIA_PARADA){
-            estado = OBSTACULO;
-            tempo_perdido = 0;                      // Reseta o tempo pois ele não perdeu a linha
-        }
-        // Prioridade 2: Seguidor de Linha
-        else if (esq_na_linha && dir_na_linha){
-            estado = FRENTE;
-                                                    // LÓGICA DA TARJA: Se estava virando à direita e achou a tarja dupla...
-                                                    // Ativa o bloqueio: Ignora a esquerda por 25 ciclos (250 ms)               [10]
-            if (ultimo_estado == CURVA_DIREITA){ bloqueio_esquerda_timer = 10; }
-            ultimo_estado = FRENTE;                 // Salva na memória
-            tempo_perdido = 0;                      // Zera o cronômetro de perda
-        }      
-        else if (esq_na_linha && !dir_na_linha){
-                                                    // LÓGICA DE DEFESA: O sensor pediu para virar à esquerda!
-                                                    // Mas o temporizador diz que acabamos de cruzar a tarja. É um falso positivo!
-                                                    // Ignora a ordem de virar à esquerda e força o carrinho a ir para frente para pular a fita.
-            if (bloqueio_esquerda_timer > 0){ estado = FRENTE; }
-            else{
-                estado = CURVA_DIREITA;             // Passou o tempo de segurança, é uma curva à esquerda verdadeira.
-                ultimo_estado = CURVA_DIREITA;
-            }
-            tempo_perdido = 0;    
-        }    
-        else if (!esq_na_linha && dir_na_linha){
-                                                    // LÓGICA DE DEFESA: O sensor pediu para virar à esquerda!                
-                                                    // Mas o temporizador diz que acabamos de cruzar a tarja. É um falso positivo!
-                                                    // Ignora a ordem de virar à esquerda e força o carrinho a ir para frente para pular a fita.
-            if (bloqueio_esquerda_timer > 0){ estado = FRENTE; }
-            else{
-                estado = CURVA_ESQUERDA;            // Passou o tempo de segurança, é uma curva à esquerda verdadeira.
-                ultimo_estado = CURVA_ESQUERDA;
-            }
-            tempo_perdido = 0;              
-        }
-        else{
-            if(tempo_perdido < 50){                 // Verifica se está perdido a menos de 100 ciclos (100 * 10ms = 1 segundo)  [50]
-                    estado = FRENTE;                // Mantém a última manobra para tentar se recuperar
-                    tempo_perdido++;
-            }
-            else    estado = PARADO;                // Se passou de 1 segundo sem ver a linha. Para
-        }
-
-
-// ================================================== AÇÃO DOS ESTADOS ==========================================================
-        switch (estado){
-            case OBSTACULO:
-                set_direcao(gpioa_dev, gpioe_dev, true, true);      // Obstáculo detectado: Para os motores IMEDIATAMENTE
-                set_led(1, 0);                                      // Verde
-                set_velocidade(VEL_PARADO, VEL_PARADO);
-                if (contador % 50 == 0)                             printk("ALERTA: Obstaculo a %u cm!\n", dist);
-                break;
-
-
-            case FRENTE:
-                set_direcao(gpioa_dev, gpioe_dev, true, true);      // Ambos os sensores na linha -> velocidade máxima      
-                set_led(1, 1);                                      // Ciano
-                set_velocidade(VEL_FRENTE_A, VEL_CURVA_REVERSA);
-                break;
-
-
-            case CURVA_DIREITA:
-                set_direcao(gpioa_dev, gpioe_dev, true, false);     // Sensor B perdeu linha -> motor B inverte (dir.), motor A continua (esq.)    
-                set_led(0, 1);                                      // Verde
-                set_velocidade(VEL_FRENTE_A, VEL_CURVA_REVERSA);
-                k_busy_wait(100);
-                break;
-
-
-            case CURVA_ESQUERDA:
-                set_direcao(gpioa_dev, gpioe_dev, false, true);     // Sensor A perdeu linha -> motor A inverte (esq.), motor B continua (dir.)            
-                set_led(1, 0);                                      // Azul
-                set_velocidade(VEL_CURVA_REVERSA_A, VEL_FRENTE);
-                k_busy_wait(100);
-                break;
-
-
-            case PARADO:
-                set_direcao(gpioa_dev, gpioe_dev, true, true);      // Ambos os sensores na linha -> velocidade máxima      
-                set_led(1, 1);                                      // Ciano
-                set_velocidade(VEL_FRENTE_A, VEL_FRENTE);
-                k_busy_wait(100);
-                set_direcao(gpioa_dev, gpioe_dev, true, true);      // Nenhum sensor detecta linha -> para tudo    
-                set_led(0, 0);                                      // Apagado
-                set_velocidade(VEL_PARADO, VEL_PARADO);
-                break;
-        }
-        contador++;
-        k_msleep(10); // Loop de 100Hz
-    }
+    // Aqui, o sistema operacional amarra a nossa função 'echo_isr' ao evento de mudança física no pino ECHO_PIN.
+    gpio_init_callback(&echo_cb_data, echo_isr, BIT(ECHO_PIN));
+    gpio_add_callback(gpio_dev, &echo_cb_data);
+                                                                printk("[SISTEMA] Ultrassom iniciado: Trig=PTD1, Echo=PTD3\n");
 }
-//======================================================================
-//PINAGEM FÍSICA
-//======================================================================
-//                              Microcontrolar         Ponte H
-//MOTOR A - PWM                 PTB2                   ENA          (Cinza)
-//MOTOR B - PWM                 PTB3                   ENB          (Marrom)
-//MOTOR A - DIREÇÃO 1           PTE0                   IN1          (Branco)
-//MOTOR A - DIREÇÃO 2           PTE1                   IN2          (Cinza)
-//MOTOR B - DIREÇÃO 1           PTA16                  IN3          (Laranja)
-//MOTOR B - DIREÇÃO 2           PTA17                  IN4          (Roxo)
-//SENSOR A (CONTROLA MOTOR A)   PTA1            
-//SENSOR B (CONTROLA MOTOR B)   PTE30
-//ULTRASSOM TRIGGER             PTD1
-//ULTRASSOM ECHO                PTD3
 
+// ============================= ENVIA PULSO DE 10us PARA INICIAR A LEITURA (ASSÍNCRONO) ========================================
+void ultrassom_trigger(void){
+    /* EXPLICAÇÃO DO TRIGGER:
+     * O HC-SR04 precisa de um "choque" de exatos 10 microssegundos para acordar e emitir o som.
+     * O 'k_busy_wait' trava a CPU propositalmente por 10us (uma trava tão curta que não afeta os motores)
+     * garantindo o pulso perfeito que o datasheet do sensor exige.
+     */
+    gpio_pin_set(gpio_dev, TRIG_PIN, 1);
+    k_busy_wait(10); // Pulso de trigger de 10us
+    gpio_pin_set(gpio_dev, TRIG_PIN, 0);
+}
 
-// ULTIMAS CONSIDERAÇÕES PARA SE FAZER:
-// 1. Implementar a seguinte lógica de condição:
-// Fazer com que o carrinho siga percurso quando ambos os sensores infravermelhos deixarem de fazer a leitura, isso impediria que o carrinho
-// pare quando ele chega no cruzamento da pista
-
-
-// SOLUÇÕES/IDEIAS:
-// - Aumentar a velocidade das rodas.
-// - Colocar um "if". Na qual a condição dele seja capaz de diferenciar quando está passando pelo cruzamento e quando está sendo retirado do chão
-//      Para isso, pensei implementar uma variável que esteja fazendo a leitura e armazenando os estados que o carrinho está executando. Isso taria dentro do "if"
-
-
-// 2. Achar a velocidade ideal do carrinho para fazer as voltas com o máximo de eficiência e em menos tempo possível
+/* EXPLICAÇÃO DO ENCAPSULAMENTO:
+ * Ao invés do 'main' acessar as variáveis globais direto, ele usa estas funções.
+ * Isso blinda a lógica do sensor: o 'main' só pode "ler" os dados, nunca corromper ou escrever por acidente
+ * por cima dos cálculos feitos durante a interrupção.
+ */
+uint32_t ultrassom_get_distancia(void){      return distancia_cm; }
+uint32_t ultrassom_get_debug_count(void){    return isr_count;    }
