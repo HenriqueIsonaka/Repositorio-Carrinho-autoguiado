@@ -209,14 +209,14 @@ int main(void) {
             case FRENTE:
                 set_direcao(gpioa_dev, gpioe_dev, true, true);      // Ambos os sensores na linha -> velocidade máxima      
                 set_led(1, 1);                                      // Ciano
-                set_velocidade(VEL_FRENTE_A, VEL_FRENTE);
+                set_velocidade(VEL_FRENTE_A, VEL_CURVA_REVERSA);
                 break;
 
 
             case CURVA_DIREITA:
                 set_direcao(gpioa_dev, gpioe_dev, true, false);     // Sensor B perdeu linha -> motor B inverte (dir.), motor A continua (esq.)    
                 set_led(0, 1);                                      // Verde
-                set_velocidade(VEL_CURVA_REVERSA_A, VEL_CURVA_REVERSA);
+                set_velocidade(VEL_FRENTE_A, VEL_CURVA_REVERSA);
                 k_busy_wait(100);
                 break;
 
@@ -224,7 +224,7 @@ int main(void) {
             case CURVA_ESQUERDA:
                 set_direcao(gpioa_dev, gpioe_dev, false, true);     // Sensor A perdeu linha -> motor A inverte (esq.), motor B continua (dir.)            
                 set_led(1, 0);                                      // Azul
-                set_velocidade(VEL_CURVA_REVERSA_A, VEL_CURVA_REVERSA);
+                set_velocidade(VEL_CURVA_REVERSA_A, VEL_FRENTE);
                 k_busy_wait(100);
                 break;
 
