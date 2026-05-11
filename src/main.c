@@ -1,107 +1,96 @@
-
+#include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
+#include "pwm_z42.h"
 
-// ==============================================================================================================================
-// DEFINIÇÃO E SELEÇÃO/CONFIGURAÇÕES DE PARÂMETROS
-// ==============================================================================================================================
-#define TRIG_PIN 1                              // PTD1
-#define ECHO_PIN 3                              // PTD3
+#define TPM_IRQ_LINE TPM1_IRQn
+#define TPM_IRQ_PRIORITY 1
 
-/* EXPLICAÇÃO DOS STRUCTS:
- * Aqui criamos ponteiros para acessar o hardware da placa (Porta D) e para a estrutura de callback 
- * que o sistema operacional Zephyr exige para gerenciar as interrupções de pinos.
- */
-static const struct device *gpio_dev;
-static struct gpio_callback echo_cb_data;
+// Pinos
+#define PORTA_A DT_NODELABEL(gpioa)
+#define TRIG_PIN 1 // PTA1
 
-/* EXPLICAÇÃO DO 'VOLATILE':
- * A palavra-chave 'volatile' foi crucial aqui. Ela avisa ao compilador: "Não otimize ou faça cache destas
- * variáveis! Elas podem mudar a qualquer instante por forças externas (o sensor)". Como essas variáveis são 
- * modificadas dentro de uma Interrupção (ISR) paralela ao código principal, sem o 'volatile', o 'main.c' 
- * leria valores congelados, e o carrinho nunca enxergaria o obstáculo.
- */
-volatile uint32_t tempo_inicio = 0;
-volatile uint32_t distancia_cm = 999;
-volatile uint32_t isr_count = 0;                // Contador para saber se o sinal físico chegou
+// LED para feedback visual do obstáculo
+static const struct gpio_dt_spec led_red = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
-// ==============================================================================================================================
-// ISR: Disparada em qualquer mudança (subida ou descida) no pino Echo
-// ==============================================================================================================================
-/* EXPLICAÇÃO DA ISR (Interrupt Service Routine):
- * Uma ISR paralisa a CPU instantaneamente no exato nanossegundo em que o pino Echo muda fisicamente de estado.
- * Isso resolve os atrasos de leitura. Se o 'main' estivesse ocupado controlando os motores, a ISR interrompe 
- * tudo, anota o tempo e devolve o controle.
- */
-void echo_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
-    uint32_t agora = k_cycle_get_32();              // k_cycle_get_32() acessa o relógio interno do microcontrolador (ciclos de CPU).
-    isr_count++;                                    // É um cronômetro de extrema precisão nativo do Zephyr.
+// Variáveis voláteis (modificadas dentro da interrupção)
+volatile uint16_t t0 = 0;
+volatile uint16_t pulse_ticks = 0;
+volatile bool edge_state = false; // false = esperando subida, true = esperando descida
+volatile bool nova_leitura = false;
 
-    // Borda de Subida: Início do eco
-    if(gpio_pin_get(dev, ECHO_PIN) > 0) tempo_inicio = agora;      // O som acabou de sair do sensor. Marcamos a "foto" desse instante salvando o ciclo da CPU atual.
-    
-    // Borda de Descida: Fim do eco
-    else{    
-        if(tempo_inicio != 0){                              // O som bateu no obstáculo e voltou.
-            uint32_t diff = agora - tempo_inicio;           // Calculamos a diferença de ciclos desde que o som saiu até ele voltar
-            
-            // Converte ciclos de CPU para microssegundos e divide por 58 (constante do som)
-            
-            /* EXPLICAÇÃO DA MATEMÁTICA:
-             * 'k_cyc_to_us_floor32' converte o tempo de forma independente do clock da sua placa.
-             * A velocidade do som é ~340 m/s (ou 0.034 cm/us). 
-             * Como o som vai e volta, a fórmula real é: Distância = (Tempo(us) * 0.034) / 2.
-             * Dividir por 58 é a simplificação exata dessa fórmula, evitando uso de números quebrados (float) 
-             * que deixariam o microcontrolador mais lento.
-             */
-            distancia_cm = k_cyc_to_us_floor32(diff) / 58;
-            tempo_inicio = 0;                              // Zera o cronômetro para não processar dados fantasmas na próxima vez
+/* --- INTERRUPÇÃO DO TPM1 --- */
+void tpm1_isr(void *arg){
+    TPM1->STATUS |= TPM_STATUS_CH0F_MASK; // Zera a flag da interrupção
+    uint16_t current_capture = TPM1->CONTROLS[0].CnV;
+
+    if (!edge_state) {
+        // Capturou a Borda de Subida (Início do pulso Echo)
+        t0 = current_capture;
+        edge_state = true;
+    } else {
+        // Capturou a Borda de Descida (Fim do pulso Echo)
+        if (current_capture >= t0) {
+            pulse_ticks = current_capture - t0;
+        } else {
+            // Trata o caso de "overflow" do timer (passou de 65535 para 0)
+            pulse_ticks = (65535 - t0) + current_capture + 1;
         }
+        edge_state = false;
+        nova_leitura = true; // Avisa o main() que o cálculo terminou
     }
 }
 
-// ============================= INICIALIZA OS PINOS E INTERRUPÇÕES DO ULTRASSOM HC-SR04 ========================================
-void ultrassom_init(void) {
-    gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpiod));
-    
-    // O Zephyr é muito rigoroso. Se o hardware (.overlay) não estiver declarado, tentar configurá-lo
-    // gera um HardFault (tela azul da morte dos microcontroladores).
-    if (!device_is_ready(gpio_dev)) {
-                                                                printk("[ERRO] Porta D não habilitada no .overlay!\n");
-        return;
+void main(void)
+{
+    // 1. Configuração do Pino Trigger e LED
+    const struct device *gpioa_dev = DEVICE_DT_GET(PORTA_A);
+    gpio_pin_configure(gpioa_dev, TRIG_PIN, GPIO_OUTPUT_INACTIVE);
+    gpio_pin_configure_dt(&led_red, GPIO_OUTPUT_INACTIVE);
+
+    // 2. Conecta a interrupção via Zephyr
+    IRQ_CONNECT(TPM_IRQ_LINE, TPM_IRQ_PRIORITY, tpm1_isr, NULL, 0);
+    irq_enable(TPM_IRQ_LINE);
+ 
+    // 3. Inicializa TPM1 e Input Capture (Borda de Subida e Descida)
+    pwm_tpm_Init(TPM1, TPM_PLLFLL, 65535, TPM_CLK, PS_128, EDGE_PWM);
+    pwm_tpm_Ch_Init(TPM1, 0, TPM_INPUT_CAPTURE_BOTH | TPM_CHANNEL_INTERRUPT, GPIOE, 20);
+
+    /* --- LOOP DE LEITURA E CALIBRAÇÃO --- */
+    while (1){
+        // A. Garante que a máquina de estados da interrupção está zerada
+        edge_state = false;
+        nova_leitura = false;
+
+        // B. Gera o pulso de 10us no pino Trigger para iniciar a leitura
+        gpio_pin_set(gpioa_dev, TRIG_PIN, 1);
+        k_busy_wait(10); // Espera 10 microssegundos
+        gpio_pin_set(gpioa_dev, TRIG_PIN, 0);
+
+        // C. Aguarda o som ir e voltar (máx ~40ms para o HC-SR04)
+        k_msleep(50); 
+
+        // D. Se a interrupção capturou o pulso com sucesso
+        if (nova_leitura) {
+            // Aplica a fórmula matemática calibrada para cm
+            uint32_t distancia_cm = (pulse_ticks * 46) / 1000;
+            
+            printk("Ticks: %u | Distancia: %u cm ", pulse_ticks, distancia_cm);
+
+            // E. Lógica do Limite de 20cm
+            if (distancia_cm > 0 && distancia_cm <= 10) {
+                printk("-> [OBSTACULO DETECTADO!]\n");
+                gpio_pin_set_dt(&led_red, 1); // Acende LED
+            } else {
+                printk("\n");
+                gpio_pin_set_dt(&led_red, 0); // Apaga LED
+            }
+        } else {
+             printk("Falha na leitura (Sensor nao conectado ou fora de alcance).\n");
+             gpio_pin_set_dt(&led_red, 0);
+        }
+        // Aguarda meio segundo até o próximo disparo (facilita ler no terminal)
+        k_msleep(500); 
     }
-    gpio_pin_configure(gpio_dev, TRIG_PIN, GPIO_OUTPUT_INACTIVE);
-    gpio_pin_configure(gpio_dev, ECHO_PIN, GPIO_INPUT);
-    
-    /* EXPLICAÇÃO DA BORDA:
-     * Usar 'BOTH' permite que a mesma função ISR faça o papel duplo: ligar o cronômetro na subida do sinal
-     * e desligar na descida. O código fica enxuto e não precisamos de dois timers separados.
-     */
-    gpio_pin_interrupt_configure(gpio_dev, ECHO_PIN, GPIO_INT_EDGE_BOTH);       // Habilita interrupção em ambas as bordas (Both Edges)  
-
-    // Aqui, o sistema operacional amarra a nossa função 'echo_isr' ao evento de mudança física no pino ECHO_PIN.
-    gpio_init_callback(&echo_cb_data, echo_isr, BIT(ECHO_PIN));
-    gpio_add_callback(gpio_dev, &echo_cb_data);
-                                                                printk("[SISTEMA] Ultrassom iniciado: Trig=PTD1, Echo=PTD3\n");
 }
-
-// ============================= ENVIA PULSO DE 10us PARA INICIAR A LEITURA (ASSÍNCRONO) ========================================
-void ultrassom_trigger(void){
-    /* EXPLICAÇÃO DO TRIGGER:
-     * O HC-SR04 precisa de um "choque" de exatos 10 microssegundos para acordar e emitir o som.
-     * O 'k_busy_wait' trava a CPU propositalmente por 10us (uma trava tão curta que não afeta os motores)
-     * garantindo o pulso perfeito que o datasheet do sensor exige.
-     */
-    gpio_pin_set(gpio_dev, TRIG_PIN, 1);
-    k_busy_wait(10); // Pulso de trigger de 10us
-    gpio_pin_set(gpio_dev, TRIG_PIN, 0);
-}
-
-/* EXPLICAÇÃO DO ENCAPSULAMENTO:
- * Ao invés do 'main' acessar as variáveis globais direto, ele usa estas funções.
- * Isso blinda a lógica do sensor: o 'main' só pode "ler" os dados, nunca corromper ou escrever por acidente
- * por cima dos cálculos feitos durante a interrupção.
- */
-uint32_t ultrassom_get_distancia(void){      return distancia_cm; }
-uint32_t ultrassom_get_debug_count(void){    return isr_count;    }
