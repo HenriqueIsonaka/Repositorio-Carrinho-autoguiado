@@ -2,7 +2,7 @@ Repositório do Carrinho
 ===================================
 Este trabalho foi feito em dupla por Gean Santos e Henrique Isonaka
 
-*OBS: ignorar commits que não começam com "Repositório do carrinho" e ignorar o primeiro commit que começa com esse nome
+*OBS: ignorar commits que não começam com "Repositório do carrinho" e ignorar o primeiro commit que começa com o nome "Repositorio carrinho autoguiado"
 
 
 
