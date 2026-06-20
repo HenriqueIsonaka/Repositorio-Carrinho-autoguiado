@@ -4,14 +4,11 @@
 #include <zephyr/sys/printk.h>
 #include <pwm_z42.h>
 #include "ultrassom.h"
-
-
 // ==============================================================================================================================
 // DEFINIÇÕES E VELOCIDADES
 // ==============================================================================================================================
 #define TPM_MODULE          1000
-#define DISTANCIA_PARADA    20    // Distância de segurança em cm
-
+#define DISTANCIA_PARADA    26.5    // Distância de segurança em cm
 
 // Motor B está girando menos em relação ao Motor A, devido a defeito mecânico. Por essa razão, tem-se que abaixar a potência do Motor A para
 // equilibrar as velocidades de rotação de ambos. A relação de ambos para o equilíbrio é de:
@@ -21,14 +18,12 @@
 // Desta forma, basta utilizar proporcionalidade (regra de 3) para definir a potência do Motor A sobre qualquer valor para o Motor B, para qual
 // estejam em equilíbrio
 
-
 // Ajuste das velocidades (Lembre-se de fornecer o suficiente para "VEL_FRENTE/A" para haver torque, para assim, quebrar a inércia do motor)
-uint16_t VEL_FRENTE             = TPM_MODULE;          // diminuir velocidade
-uint16_t VEL_FRENTE_A           = TPM_MODULE * 0.9123;   //diminuir velocidade
+uint16_t VEL_FRENTE             = TPM_MODULE;            // diminuir velocidade
+uint16_t VEL_FRENTE_A           = TPM_MODULE * 0.9123;   // diminuir velocidade
 uint16_t VEL_CURVA_REVERSA      = TPM_MODULE;            
 uint16_t VEL_CURVA_REVERSA_A    = TPM_MODULE * 0.9123;
 uint16_t VEL_PARADO             = 0;
-
 
 // Definição das portas e pinos dos sensores a serem utilizadas
 #define PORTA_A         DT_NODELABEL(gpioa)
@@ -36,12 +31,9 @@ uint16_t VEL_PARADO             = 0;
 #define SENSOR_A_PIN    1                       // PTA1     (Sensor da Esquerda)
 #define SENSOR_B_PIN    30                      // PTE30    (Sensor da Direita)
 
-
 // Definição dos LEDs via DeviceTree
 static const struct gpio_dt_spec led_blue   = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static const struct gpio_dt_spec led_green  = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
-
-
 // ==============================================================================================================================
 // MÁQUINA DE ESTADOS
 // ==============================================================================================================================
@@ -52,8 +44,6 @@ typedef enum {
     CURVA_DIREITA,      // Sensor B perdeu linha -> vira à direita
     OBSTACULO
 } carrinho_estado_t;
-
-
 // ==============================================================================================================================
 // HELPERS (Simplificador de comandos, configura os pinos a serem usados e integra a ação desses pinos através de um único comando)
 // ==============================================================================================================================
@@ -82,8 +72,6 @@ static inline void set_direcao(const struct device *dev_a, const struct device *
         gpio_pin_set(dev_a, 17, 1);     // IN4 = 0 (Ré)            
     }
 }
-
-
 // ==============================================================================================================================
 // MAIN
 // ==============================================================================================================================
@@ -132,14 +120,11 @@ int main(void) {
         // Dispara o trigger a cada 50ms (5 ciclos de 10ms)
         if (contador % 5 == 0)  ultrassom_trigger();
 
-
         uint32_t dist = ultrassom_get_distancia();
-
 
         // ========= Leitura dos Sensores IR (Lógica invertida: 0 = detecta linha) =============
         bool esq_na_linha = (gpio_pin_get(gpioa_dev, SENSOR_A_PIN) == 0);
         bool dir_na_linha = (gpio_pin_get(gpioe_dev, SENSOR_B_PIN) == 0);
-
 
         // =============================== Transição de estados  ===============================
         //      A   B       |       Ação
@@ -149,7 +134,6 @@ int main(void) {
         //      1   1       |       Parado          - linha perdida completamente
        
         if (bloqueio_esquerda_timer > 0)    bloqueio_esquerda_timer--;      // Decrementa o temporizador de bloqueio a cada ciclo de 10ms
-
 
         // Prioridade 1: Segurança (Obstáculo)
         if (dist > 0 && dist < DISTANCIA_PARADA){
@@ -194,8 +178,6 @@ int main(void) {
             }
             else    estado = PARADO;                // Se passou de 1 segundo sem ver a linha. Para
         }
-
-
 // ================================================== AÇÃO DOS ESTADOS ==========================================================
         switch (estado){
             case OBSTACULO:
@@ -204,31 +186,23 @@ int main(void) {
                 set_velocidade(VEL_PARADO, VEL_PARADO);
                 if (contador % 50 == 0)                             printk("ALERTA: Obstaculo a %u cm!\n", dist);
                 break;
-
-
             case FRENTE:
                 set_direcao(gpioa_dev, gpioe_dev, true, true);      // Ambos os sensores na linha -> velocidade máxima      
                 set_led(1, 1);                                      // Ciano
                 set_velocidade(VEL_FRENTE_A, VEL_FRENTE);
                 break;
-
-
             case CURVA_DIREITA:
                 set_direcao(gpioa_dev, gpioe_dev, true, false);     // Sensor B perdeu linha -> motor B inverte (dir.), motor A continua (esq.)    
                 set_led(0, 1);                                      // Verde
                 set_velocidade(VEL_CURVA_REVERSA_A, VEL_CURVA_REVERSA);
                 k_busy_wait(100);
                 break;
-
-
             case CURVA_ESQUERDA:
                 set_direcao(gpioa_dev, gpioe_dev, false, true);     // Sensor A perdeu linha -> motor A inverte (esq.), motor B continua (dir.)            
                 set_led(1, 0);                                      // Azul
                 set_velocidade(VEL_CURVA_REVERSA_A, VEL_CURVA_REVERSA);
                 k_busy_wait(100);
                 break;
-
-
             case PARADO:
                 set_direcao(gpioa_dev, gpioe_dev, true, true);      // Ambos os sensores na linha -> velocidade máxima      
                 set_led(1, 1);                                      // Ciano
@@ -257,18 +231,3 @@ int main(void) {
 //SENSOR B (CONTROLA MOTOR B)   PTE30
 //ULTRASSOM TRIGGER             PTD1
 //ULTRASSOM ECHO                PTD3
-
-
-// ULTIMAS CONSIDERAÇÕES PARA SE FAZER:
-// 1. Implementar a seguinte lógica de condição:
-// Fazer com que o carrinho siga percurso quando ambos os sensores infravermelhos deixarem de fazer a leitura, isso impediria que o carrinho
-// pare quando ele chega no cruzamento da pista
-
-
-// SOLUÇÕES/IDEIAS:
-// - Aumentar a velocidade das rodas.
-// - Colocar um "if". Na qual a condição dele seja capaz de diferenciar quando está passando pelo cruzamento e quando está sendo retirado do chão
-//      Para isso, pensei implementar uma variável que esteja fazendo a leitura e armazenando os estados que o carrinho está executando. Isso taria dentro do "if"
-
-
-// 2. Achar a velocidade ideal do carrinho para fazer as voltas com o máximo de eficiência e em menos tempo possível
