@@ -76,7 +76,7 @@ Desse modo, o primeiro problema da execução do carrinho surgiu novamente na te
 
 <img width="426" height="240" alt="Gif carrinho inconsistente" src="https://github.com/user-attachments/assets/ac66ef77-7378-43de-9638-291b8a2054be" />
 
-Commit 6
+Commit 7
 
 Foi implementada uma atualização no código anterior que fez com que, em uma curva, a velocidade da roda externa fosse aumentada para o máximo.
 
@@ -84,7 +84,7 @@ Resultado: isso permitiu que o carrinho fizesse a curva da forma mais fechada po
 
 Assim, o carrinho conseguia executar múltiplas voltas consecutivas em tempos muito menores.
 
-Commit 7
+Commit 8
 
 Foi adicionado um delay nas funções de curva para que elas continuassem a ser executadas por 100 microssegundos após os sensores pararem de detectar a linha da pista (por meio da função k_busy_wait()). Isso foi feito com o objetivo de fazer o carrinho gastar o mínimo de tempo possível em funções de curva, para que ele executasse voltas mais rápidas.
 
@@ -92,7 +92,7 @@ Resultado: O carrinho diminuiu o tempo de volta em meio segundo com o delay. Tam
 
 <img width="426" height="240" alt="Carrinho final circuito" src="https://github.com/user-attachments/assets/d8da4c43-41f4-4531-a7df-2035c6eb408e" />
 
-Commit 8
+Commit 9
 
 Para a competição, seria necessário fazer o carrinho parar completamente o mais próximo possível dos 20 cm de distância de um obstáculo
 
