@@ -1,61 +1,55 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/sys/printk.h>
 #include <pwm_z42.h>
+#include "ultrassom.h"
 
-//=============================================================
-// CONFIGURAÇÕES DE VELOCIDADE
-//=============================================================
+// ==============================================================================================================================
+// DEFINIÇÕES E VELOCIDADES
+// ==============================================================================================================================
 #define TPM_MODULE          1000
+#define DISTANCIA_PARADA    20    // Distância de segurança em cm
 
-uint16_t VEL_FRENTE         = TPM_MODULE;           // 100% - Linha detectada
-uint16_t VEL_FRENTE_A       = TPM_MODULE * 0.9123;  // 91,23% para o Motor A para compensar falha mecânica no B
-uint16_t VEL_CURVA_RAPIDA   = TPM_MODULE * 0.75;    // 75% - Roda externa da curva
-uint16_t VEL_CURVA_LENTA    = TPM_MODULE * 0.55;    // 50% - Roda interna da curva
-uint16_t VEL_PARADO         = 0;
+// Motor B está girando menos em relação ao Motor A, devido a defeito mecânico. Por essa razão, tem-se que abaixar a potência do Motor A para
+// equilibrar as velocidades de rotação de ambos. A relação de ambos para o equilíbrio é de:
+// 
+// MOTOR B = 100% da potência -----> MOTOR A = 91,23% da potência      (Sob velocidades máximas)
+//
+// Desta forma, basta utilizar proporcionalidade (regra de 3) para definir a potência do Motor A sobre qualquer valor para o Motor B, para qual
+// estejam em equilíbrio
 
-//============================================================
-// PINOS
-//============================================================
-#define PORTA_A             DT_NODELABEL(gpioa)
-#define PORTA_E             DT_NODELABEL(gpioe)
+// Ajuste das velocidades (Lembre-se de fornecer o suficiente para "VEL_FRENTE/A" para haver torque, para assim, quebrar a inércia do motor)
+uint16_t VEL_FRENTE             = TPM_MODULE;            
+uint16_t VEL_FRENTE_A           = TPM_MODULE * 0.9123;
+uint16_t VEL_CURVA_REVERSA      = TPM_MODULE * 0.8;            
+uint16_t VEL_CURVA_REVERSA_A    = TPM_MODULE * 0.72984; 
+uint16_t VEL_PARADO             = 0;
 
-#define SENSOR_A_PIN        1                      // PTA1 - sensor esquerdo
-#define SENSOR_B_PIN        30                     // PTE30 - sensor direito
+// Definição das portas e pinos dos sensores a serem utilizadas 
+#define PORTA_A         DT_NODELABEL(gpioa)
+#define PORTA_E         DT_NODELABEL(gpioe)
+#define SENSOR_A_PIN    1                       // PTA1     (Sensor da Esquerda)
+#define SENSOR_B_PIN    30                      // PTE30    (Sensor da Direita)
 
-#define TRIG_PIN	    2			   // PTA2 - disparo do Ultrassom
-// O pino de Echo é configurado direto no TPM1: PTE20
-
-// LEDs via DeviceTree
+// Definição dos LEDs via DeviceTree
 static const struct gpio_dt_spec led_blue   = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static const struct gpio_dt_spec led_green  = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 
-//===========================================================
-// VARIÁVEIS DA INTERRUPÇÃO (ULTRASSOM)
-//===========================================================
-#define TPM_IRQ_LINE	    TPM1_IRQn
-#define TPM_IRQ_PRIORITY    1
-
-volatile uint16_t t0	          = 0;
-volatile uint16_t pulse_ticks     = 0;
-volatile bool	  edge_state      = false;
-volatile bool     nova_leitura_us = false;
-volatile uint32_t distancia_atual = 999;	// Inicia com valor seguro
-
-//===========================================================
+// ==============================================================================================================================
 // MÁQUINA DE ESTADOS
-//===========================================================
-typedef enum{ 
-    Parado, 
-    Frente, 
-    Curva_Esquerda,     // Sensor A perdeu linha -> vira à esquerda
-    Curva_Direita,      // Sensor B perdeu linha -> vira à direita
-    Obstaculo
-} carrinho_t;
+// ==============================================================================================================================
+typedef enum { 
+    PARADO, 
+    FRENTE,
+    CURVA_ESQUERDA,     // Sensor A perdeu linha -> vira à esquerda
+    CURVA_DIREITA,      // Sensor B perdeu linha -> vira à direita
+    OBSTACULO 
+} carrinho_estado_t;
 
-//===========================================================
-// FUNÇÕES AUXILIARES E INTERRUPÇÃO
-//===========================================================
+// ==============================================================================================================================
+// HELPERS (Simplificador de comandos, configura os pinos a serem usados e integra a ação desses pinos através de um único comando)
+// ==============================================================================================================================
 static inline void set_velocidade(uint16_t motor_a, uint16_t motor_b){
     pwm_tpm_CnV(TPM2, 0, motor_a);
     pwm_tpm_CnV(TPM2, 1, motor_b);
@@ -64,87 +58,77 @@ static inline void set_led(int blue, int green){
     gpio_pin_set_dt(&led_blue, blue);
     gpio_pin_set_dt(&led_green, green);
 }
-
-void tpm1_isr(void *arg){
-    TPM1->STATUS |= TPM_STATUS_CH0F_MASK;
-    uint16_t current_capture = TPM1->CONTROLS[0].CnV;
-
-    if(!edge_state){
-	t0 = current_capture;
-	edge_state = true;
-    } 
-    else{
-	if(current_capture >= t0) {
-		pulse_ticks = current_capture - t0;
-	} else {
-		pulse_ticks = (65535 - t0) + current_capture + 1;
-	}
-	edge_state = false;
-	nova_leitura_us = true;		
+// Controla a direção alterando a Ponte H dinamicamente
+static inline void set_direcao(const struct device *dev_a, const struct device *dev_e, bool motor_a_frente, bool motor_b_frente) {
+    if (motor_a_frente) {               // Motor A (Pinos PTE0 e PTE1)
+        gpio_pin_set(dev_e, 0, 1);      // IN1 = 0                  
+        gpio_pin_set(dev_e, 1, 0);      // IN2 = 1                   
+    } else {
+        gpio_pin_set(dev_e, 0, 0);      // IN1 = 1 (Ré)              
+        gpio_pin_set(dev_e, 1, 1);      // IN2 = 0 (Ré)              
+    }
+    if (motor_b_frente) {               // Motor B (Pinos PTA16 e PTA17)
+        gpio_pin_set(dev_a, 16, 1);     // IN3 = 0                  
+        gpio_pin_set(dev_a, 17, 0);     // IN4 = 1                  
+    } else {
+        gpio_pin_set(dev_a, 16, 0);     // IN3 = 1 (Ré)             
+        gpio_pin_set(dev_a, 17, 1);     // IN4 = 0 (Ré)             
     }
 }
 
-//===========================================================
+// ==============================================================================================================================
 // MAIN
-//===========================================================
-int main(void){
-    // 1. PWM - Motores (TPM2)
-    pwm_tpm_Init(TPM2, TPM_PLLFLL, TPM_MODULE, TPM_CLK, PS_128, EDGE_PWM);     
-    pwm_tpm_Ch_Init(TPM2, 0, TPM_PWM_H, GPIOB, 2);      // ENA - Motor A    (Esquerda)
-    pwm_tpm_Ch_Init(TPM2, 1, TPM_PWM_H, GPIOB, 3);      // ENB - Motor B    (Direito)
-
-    // 2. Ultrassom (TPM1 - Input Capture)
-    IRQ_CONNECT(TPM_IRQ_LINE, TPM_IRQ_PRIORITY, tpm1_isr, NULL, 0);
-    irq_enable(TPM_IRQ_LINE);
-    pwm_tpm_Init(TPM1, TPM_PLLFLL, 65535, TPM_CLK, PS_128, EDGE_PWM);
-    pwm_tpm_Ch_Init(TPM1, 0, TPM_INPUT_CAPTURE_BOTH | TPM_CHANNEL_INTERRUPT, GPIOE, 20);
-
-    // 3. Portas e Pinos - Direção dos motores e Sensores
-    const struct device *gpioa_dev = DEVICE_DT_GET(PORTA_A);                    
-    const struct device *gpioe_dev = DEVICE_DT_GET(PORTA_E);                    
-    if(!device_is_ready(gpioa_dev) || !device_is_ready(gpioe_dev)) return 0;
-
+// ==============================================================================================================================
+int main(void) {
+                                                                    printk("[SISTEMA] Iniciando integração total do Carrinho...\n");
+    // 1. Inicializa PWM (TPM2) para os Motores
+    pwm_tpm_Init   (TPM2, TPM_PLLFLL, TPM_MODULE, TPM_CLK, PS_128, EDGE_PWM);
+    pwm_tpm_Ch_Init(TPM2, 0, TPM_PWM_H, GPIOB, 2);                  // ENA - Motor A
+    pwm_tpm_Ch_Init(TPM2, 1, TPM_PWM_H, GPIOB, 3);                  // ENB - Motor B 
+                                                                    printk("[DEGUB] Motores inicalizados.\n");
+    // 2. Inicializa Ultrassom
+    ultrassom_init();
+                                                                    printk("[DEBUG] Ultrassom_init finalizada.\n");
+    // 3. Configura GPIOs para uso (Sensores e Direção)
+    const struct device *gpioa_dev = DEVICE_DT_GET(PORTA_A);
+    const struct device *gpioe_dev = DEVICE_DT_GET(PORTA_E);
+    if(!device_is_ready(gpioa_dev) || !device_is_ready(gpioe_dev)){
+                                                                    printk("[ERRO] Porta A ou E nao pronta!\n");
+        return 0;
+    }
     // Direção: ambos os motores para frente
-    gpio_pin_configure(gpioe_dev, 0, GPIO_OUTPUT_INACTIVE);     // IN1 = 0      Motor A --> Para Frente
-    gpio_pin_configure(gpioe_dev, 1, GPIO_OUTPUT_ACTIVE);       // IN2 = 1
-    gpio_pin_configure(gpioa_dev, 16, GPIO_OUTPUT_INACTIVE);    // IN3 = 0      Motor B --> Para Frente
-    gpio_pin_configure(gpioa_dev, 17, GPIO_OUTPUT_ACTIVE);      // IN4 = 1
-
-    // Sensores com pull-up (retorna 0 quando detecta linha) e Pino Trigger (Ultrassom)
-    gpio_pin_configure(gpioa_dev, SENSOR_A_PIN, GPIO_INPUT | GPIO_PULL_UP); 
+    gpio_pin_configure(gpioe_dev, 0,  GPIO_OUTPUT_INACTIVE);        // IN1
+    gpio_pin_configure(gpioe_dev, 1,  GPIO_OUTPUT_INACTIVE);        // IN2
+    gpio_pin_configure(gpioa_dev, 16, GPIO_OUTPUT_INACTIVE);        // IN3
+    gpio_pin_configure(gpioa_dev, 17, GPIO_OUTPUT_INACTIVE);        // IN4
+    // Sensores com pull-up (retorna 0 quando detecta linha)
+    gpio_pin_configure(gpioa_dev, SENSOR_A_PIN, GPIO_INPUT | GPIO_PULL_UP);
     gpio_pin_configure(gpioe_dev, SENSOR_B_PIN, GPIO_INPUT | GPIO_PULL_UP);
-    gpio_pin_configure(gpioa_dev, TRIG_PIN, GPIO_OUTPUT_INACTIVE);
-
-    // 4. LEDs
+                                                                    printk("[DEGUB] Configuração das GPIOs finalizada.\n");
+    // 4. Configura os LEDS para uso
     if(!gpio_is_ready_dt(&led_blue) || !gpio_is_ready_dt(&led_green)) return 0;
     gpio_pin_configure_dt(&led_blue,	GPIO_OUTPUT_INACTIVE);                 
     gpio_pin_configure_dt(&led_green,	GPIO_OUTPUT_INACTIVE);
+                                                                    printk("[DEGUB] Configuração dos LEDs finalizada.\n");
+    // 5. Define estado inicial para a máquina de estados e a váriavel volátil de verificação do ultrassom
+    carrinho_estado_t estado = PARADO;
+    carrinho_estado_t ultimo_estado = FRENTE;   // Memória da última ação válida
+    uint32_t contador = 0;              
+    uint32_t tempo_perdido = 0;                 // Contador de tempo fora da pista
+    uint32_t bloqueio_esquerda_timer = 0;
+                                                                    printk("[DEGUB] Entrando no loop principal.\n");
+// ==============================================================================================================================
+// LEITURAS
+// ==============================================================================================================================
+    while (1) {
+        // Dispara o trigger a cada 50ms (5 ciclos de 10ms)
+        if (contador % 5 == 0)  ultrassom_trigger();
 
-    // Garante que os motores iniciam parados
-    set_velocidade(VEL_PARADO, VEL_PARADO);
-
-    carrinho_t estado_atual = Parado;   
-
-    int contador_trigger = 0;	// Otimização para disparo não-bloqueante       
-
-    while(1){      
-	// =============================== Ultrassom (Assíncrono) =============================
-	// Dispara o Trigger a cada 5 ciclos (50ms) para não sobrecarregar de som e não travar o 'while'
-	if(contador_trigger++ >= 5){
-		gpio_pin_set(gpioa_dev, TRIG_PIN, 1);
-		k_busy_wait(10);			// 10us não afeta o loop do carrinho
-		gpio_pin_set(gpioa_dev, TRIG_PIN, 0);
-		contador_trigger = 0;
-	}
-	// Se a interrupção capturou um novo pulso, calculamos a distância
-	if(nova_leitura_us){
-		distancia_atual = (pulse_ticks * 46) / 1000;
-		nova_leitura_us	= false;
-	} 
+        uint32_t dist = ultrassom_get_distancia();
 
         // ========= Leitura dos Sensores IR (Lógica invertida: 0 = detecta linha) =============
-        bool linha_A = (gpio_pin_get(gpioa_dev, SENSOR_A_PIN) == 0);    
-        bool linha_B = (gpio_pin_get(gpioe_dev, SENSOR_B_PIN) == 0);    
+        bool esq_na_linha = (gpio_pin_get(gpioa_dev, SENSOR_A_PIN) == 0);
+        bool dir_na_linha = (gpio_pin_get(gpioe_dev, SENSOR_B_PIN) == 0);
 
         // =============================== Transição de estados  ===============================
         //      A   B       |       Ação
@@ -152,61 +136,113 @@ int main(void){
         //      1   0       |       Curva Dir.      - B perdeu  -   corrige para direita
         //      0   1       |       Curva Esq.      - A perdeu  -   corrige para esquerda
         //      1   1       |       Parado          - linha perdida completamente
+        
+        if (bloqueio_esquerda_timer > 0)    bloqueio_esquerda_timer--;      // Decrementa o temporizador de bloqueio a cada ciclo de 10ms
 
-	// Lógica de prioridade: Ultrassom é a prioridade máxima.
-	if(distancia_atual > 0 && distancia_atual <= 20)  estado_atual = Obstaculo;
-        else if (linha_A  &&  linha_B)  estado_atual = Frente;   
-        else if (linha_A  && !linha_B)  estado_atual = Curva_Direita;
-        else if (!linha_A &&  linha_B)  estado_atual = Curva_Esquerda;
-        else                            estado_atual = Parado; 
+        // Prioridade 1: Segurança (Obstáculo)
+        if (dist > 0 && dist < DISTANCIA_PARADA){
+            estado = OBSTACULO;
+            tempo_perdido = 0;                      // Reseta o tempo pois ele não perdeu a linha
+        }
+        // Prioridade 2: Seguidor de Linha
+        else if (esq_na_linha && dir_na_linha){
+            estado = FRENTE;
+                                                    // LÓGICA DA TARJA: Se estava virando à direita e achou a tarja dupla...
+                                                    // Ativa o bloqueio: Ignora a esquerda por 25 ciclos (250 ms)               [10]
+            if (ultimo_estado == CURVA_DIREITA){ bloqueio_esquerda_timer = 10; } 
+            ultimo_estado = FRENTE;                 // Salva na memória
+            tempo_perdido = 0;                      // Zera o cronômetro de perda
+        }      
+        else if (esq_na_linha && !dir_na_linha){
+                                                    // LÓGICA DE DEFESA: O sensor pediu para virar à esquerda!
+                                                    // Mas o temporizador diz que acabamos de cruzar a tarja. É um falso positivo!
+                                                    // Ignora a ordem de virar à esquerda e força o carrinho a ir para frente para pular a fita.
+            if (bloqueio_esquerda_timer > 0){ estado = FRENTE; } 
+            else{
+                estado = CURVA_DIREITA;             // Passou o tempo de segurança, é uma curva à esquerda verdadeira.
+                ultimo_estado = CURVA_DIREITA; 
+            }
+            tempo_perdido = 0;    
+        }     
+        else if (!esq_na_linha && dir_na_linha){
+                                                    // LÓGICA DE DEFESA: O sensor pediu para virar à esquerda!                
+                                                    // Mas o temporizador diz que acabamos de cruzar a tarja. É um falso positivo!
+                                                    // Ignora a ordem de virar à esquerda e força o carrinho a ir para frente para pular a fita.
+            if (bloqueio_esquerda_timer > 0){ estado = FRENTE; } 
+            else{
+                estado = CURVA_ESQUERDA;            // Passou o tempo de segurança, é uma curva à esquerda verdadeira.
+                ultimo_estado = CURVA_ESQUERDA; 
+            }
+            tempo_perdido = 0;              
+        }
+        else{
+            if(tempo_perdido < 50){                 // Verifica se está perdido a menos de 100 ciclos (100 * 10ms = 1 segundo)  [50]
+                    estado = FRENTE;                // Mantém a última manobra para tentar se recuperar
+                    tempo_perdido++;
+            }
+            else    estado = PARADO;                // Se passou de 1 segundo sem ver a linha. Para
+        }
 
-        // =============================== Ações por Estado ====================================
-        switch(estado_atual){     
-	    case Obstaculo:
-		set_velocidade(VEL_PARADO, VEL_PARADO);			// Carrinho para, indicando barreira
-		set_led(1, 1);						// Ciano
-		break;
-		                                  
-            case Curva_Esquerda:
-                set_velocidade(VEL_CURVA_LENTA, VEL_CURVA_RAPIDA);      // Sensor A perdeu linha -> reduz motor A (esq.), acelera B (dir.)
-                set_led(1, 0);                                          // Azul
+// ================================================== AÇÃO DOS ESTADOS ==========================================================
+        switch (estado){
+            case OBSTACULO:
+                set_direcao(gpioa_dev, gpioe_dev, true, true);      // Obstáculo detectado: Para os motores IMEDIATAMENTE
+                set_led(1, 0);                                      // Verde
+                set_velocidade(VEL_PARADO, VEL_PARADO);
+                if (contador % 50 == 0)                             printk("ALERTA: Obstaculo a %u cm!\n", dist);
                 break;
-                
-            case Curva_Direita:
-                set_velocidade(VEL_CURVA_RAPIDA, VEL_CURVA_LENTA);      // Sensor B perdeu linha -> reduz motor B (dir.), acelera A (esq.)
-                set_led(0, 1);                                          // Verde
+
+            case FRENTE:
+                set_direcao(gpioa_dev, gpioe_dev, true, true);      // Ambos os sensores na linha -> velocidade máxima       
+                set_led(1, 1);                                      // Ciano
+                set_velocidade(VEL_FRENTE_A, VEL_FRENTE);
                 break;
 
-            case Frente:
-                set_velocidade(VEL_FRENTE_A, VEL_FRENTE);     // Ambos os sensores na linha -> velocidade máxima
-                set_led(1, 1);                                // Ciano
+            case CURVA_DIREITA:
+                set_direcao(gpioa_dev, gpioe_dev, true, false);     // Sensor B perdeu linha -> motor B inverte (dir.), motor A continua (esq.)    
+                set_led(0, 1);                                      // Verde
+                set_velocidade(VEL_FRENTE_A, VEL_CURVA_REVERSA); 
                 break;
 
-            case Parado:
-                set_velocidade(VEL_PARADO, VEL_PARADO);     // Nenhum sensor detecta linha -> para tudo
-                set_led(0, 0);                              // Apagado
+            case CURVA_ESQUERDA:
+                set_direcao(gpioa_dev, gpioe_dev, false, true);     // Sensor A perdeu linha -> motor A inverte (esq.), motor B continua (dir.)             
+                set_led(1, 0);                                      // Azul
+                set_velocidade(VEL_CURVA_REVERSA_A, VEL_FRENTE);
+                break;
+
+            case PARADO:
+                set_direcao(gpioa_dev, gpioe_dev, true, true);      // Nenhum sensor detecta linha -> para tudo     
+                set_led(0, 0);                                      // Apagado
+                set_velocidade(VEL_PARADO, VEL_PARADO);
                 break;
         }
-            k_msleep(10);   // 100 Hz de atualização
+        contador++;
+        k_msleep(10); // Loop de 100Hz
     }
-    return 0;
 }
 //======================================================================
 //PINAGEM FÍSICA
 //======================================================================
-//                              Microcontrolador       Ponte H		Função
-//MOTOR A - PWM (Esq)           PTB2                   ENA		PWM - Velocidade
-//MOTOR B - PWM (Dir)           PTB3                   ENB		PWM - Velocidade
-//MOTOR A - DIREÇÃO 1           PTE0                   IN1		Direção 1
-//MOTOR A - DIREÇÃO 2           PTE1                   IN2		Direção 2
-//MOTOR B - DIREÇÃO 1           PTA16                  IN3		Direção 1
-//MOTOR B - DIREÇÃO 2           PTA17                  IN4		Direção 2
-//SENSOR A (CONTROLA MOTOR A)   PTA1            			Digital Input - Linha Esq.
-//SENSOR B (CONTROLA MOTOR B)   PTE30            			Digital Input - Linha Dir.
-//HC-SR04 TRIGGER		PTA2					Digital Output - Disparo (adaptado)
-//HC-SR04 ECHO			PTE20					TPM1_CH0 - Interrupção Captura
+//                              Microcontrolar         Ponte H
+//MOTOR A - PWM                 PTB2                   ENA          (Cinza)
+//MOTOR B - PWM                 PTB3                   ENB          (Marrom)
+//MOTOR A - DIREÇÃO 1           PTE0                   IN1          (Branco)
+//MOTOR A - DIREÇÃO 2           PTE1                   IN2          (Cinza)
+//MOTOR B - DIREÇÃO 1           PTA16                  IN3          (Laranja)
+//MOTOR B - DIREÇÃO 2           PTA17                  IN4          (Roxo)
+//SENSOR A (CONTROLA MOTOR A)   PTA1            
+//SENSOR B (CONTROLA MOTOR B)   PTE30
+//ULTRASSOM TRIGGER             PTD1
+//ULTRASSOM ECHO                PTD3
 
-// Considerações a levar:
-// Estabelecer os comandos definitivos para as curvas
-// Estabelecer potências para as curvas
-// Implementar lógica para não o carrinho não parar quando estiver no cruzamento da pista
+// ULTIMAS CONSIDERAÇÕES PARA SE FAZER:
+// 1. Implementar a seguinte lógica de condição:
+// Fazer com que o carrinho siga percurso quando ambos os sensores infravermelhos deixarem de fazer a leitura, isso impediria que o carrinho
+// pare quando ele chega no cruzamento da pista
+
+// SOLUÇÕES/IDEIAS:
+// - Aumentar a velocidade das rodas.
+// - Colocar um "if". Na qual a condição dele seja capaz de diferenciar quando está passando pelo cruzamento e quando está sendo retirado do chão
+//      Para isso, pensei implementar uma variável que esteja fazendo a leitura e armazenando os estados que o carrinho está executando. Isso taria dentro do "if"
+
+// 2. Achar a velocidade ideal do carrinho para fazer as voltas com o máximo de eficiência e em menos tempo possível
