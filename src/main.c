@@ -20,10 +20,10 @@
 // estejam em equilíbrio
 
 // Ajuste das velocidades (Lembre-se de fornecer o suficiente para "VEL_FRENTE/A" para haver torque, para assim, quebrar a inércia do motor)
-uint16_t VEL_FRENTE             = TPM_MODULE * 0.6;            
-uint16_t VEL_FRENTE_A           = TPM_MODULE * 0.54738;        
-uint16_t VEL_CURVA_REVERSA      = TPM_MODULE * 0.4;            
-uint16_t VEL_CURVA_REVERSA_A    = TPM_MODULE * 0.36492;        
+uint16_t VEL_FRENTE             = TPM_MODULE;            
+uint16_t VEL_FRENTE_A           = TPM_MODULE * 0.9123;
+uint16_t VEL_CURVA_REVERSA      = TPM_MODULE * 0.8;            
+uint16_t VEL_CURVA_REVERSA_A    = TPM_MODULE * 0.72984; 
 uint16_t VEL_PARADO             = 0;
 
 // Definição das portas e pinos dos sensores a serem utilizadas 
@@ -112,7 +112,10 @@ int main(void) {
                                                                     printk("[DEGUB] Configuração dos LEDs finalizada.\n");
     // 5. Define estado inicial para a máquina de estados e a váriavel volátil de verificação do ultrassom
     carrinho_estado_t estado = PARADO;
-    uint32_t contador = 0;
+    carrinho_estado_t ultimo_estado = FRENTE;   // Memória da última ação válida
+    uint32_t contador = 0;              
+    uint32_t tempo_perdido = 0;                 // Contador de tempo fora da pista
+    uint32_t bloqueio_esquerda_timer = 0;
                                                                     printk("[DEGUB] Entrando no loop principal.\n");
 // ==============================================================================================================================
 // LEITURAS
@@ -134,13 +137,51 @@ int main(void) {
         //      0   1       |       Curva Esq.      - A perdeu  -   corrige para esquerda
         //      1   1       |       Parado          - linha perdida completamente
         
+        if (bloqueio_esquerda_timer > 0)    bloqueio_esquerda_timer--;      // Decrementa o temporizador de bloqueio a cada ciclo de 10ms
+
         // Prioridade 1: Segurança (Obstáculo)
-        if (dist > 0 && dist < DISTANCIA_PARADA)    estado = OBSTACULO;
+        if (dist > 0 && dist < DISTANCIA_PARADA){
+            estado = OBSTACULO;
+            tempo_perdido = 0;                      // Reseta o tempo pois ele não perdeu a linha
+        }
         // Prioridade 2: Seguidor de Linha
-        else if (esq_na_linha && dir_na_linha)      estado = FRENTE;
-        else if (esq_na_linha && !dir_na_linha)     estado = CURVA_DIREITA;     // Curva fechada para direita
-        else if (!esq_na_linha && dir_na_linha)     estado = CURVA_ESQUERDA;    // Curva fechada para esquerda
-        else                                        estado = PARADO;            // Perdeu a linha
+        else if (esq_na_linha && dir_na_linha){
+            estado = FRENTE;
+                                                    // LÓGICA DA TARJA: Se estava virando à direita e achou a tarja dupla...
+                                                    // Ativa o bloqueio: Ignora a esquerda por 25 ciclos (250 ms)               [10]
+            if (ultimo_estado == CURVA_DIREITA){ bloqueio_esquerda_timer = 10; } 
+            ultimo_estado = FRENTE;                 // Salva na memória
+            tempo_perdido = 0;                      // Zera o cronômetro de perda
+        }      
+        else if (esq_na_linha && !dir_na_linha){
+                                                    // LÓGICA DE DEFESA: O sensor pediu para virar à esquerda!
+                                                    // Mas o temporizador diz que acabamos de cruzar a tarja. É um falso positivo!
+                                                    // Ignora a ordem de virar à esquerda e força o carrinho a ir para frente para pular a fita.
+            if (bloqueio_esquerda_timer > 0){ estado = FRENTE; } 
+            else{
+                estado = CURVA_DIREITA;             // Passou o tempo de segurança, é uma curva à esquerda verdadeira.
+                ultimo_estado = CURVA_DIREITA; 
+            }
+            tempo_perdido = 0;    
+        }     
+        else if (!esq_na_linha && dir_na_linha){
+                                                    // LÓGICA DE DEFESA: O sensor pediu para virar à esquerda!                
+                                                    // Mas o temporizador diz que acabamos de cruzar a tarja. É um falso positivo!
+                                                    // Ignora a ordem de virar à esquerda e força o carrinho a ir para frente para pular a fita.
+            if (bloqueio_esquerda_timer > 0){ estado = FRENTE; } 
+            else{
+                estado = CURVA_ESQUERDA;            // Passou o tempo de segurança, é uma curva à esquerda verdadeira.
+                ultimo_estado = CURVA_ESQUERDA; 
+            }
+            tempo_perdido = 0;              
+        }
+        else{
+            if(tempo_perdido < 50){                 // Verifica se está perdido a menos de 100 ciclos (100 * 10ms = 1 segundo)  [50]
+                    estado = FRENTE;                // Mantém a última manobra para tentar se recuperar
+                    tempo_perdido++;
+            }
+            else    estado = PARADO;                // Se passou de 1 segundo sem ver a linha. Para
+        }
 
 // ================================================== AÇÃO DOS ESTADOS ==========================================================
         switch (estado){
